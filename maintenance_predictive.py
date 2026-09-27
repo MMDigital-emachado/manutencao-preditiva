@@ -170,3 +170,319 @@ def analise_exploratoria(df):
 # ============================================================ FASE 2
 
 
+def limpar_dados(df):
+    """
+    Descarta os registros com sensores faltantes e remove as colunas que
+    não podem entrar como feature.
+
+    São 500 registros (5%) com pelo menos um sensor nulo, descartados em
+    vez de preenchidos com a mediana. Completar preservaria 500 linhas,
+    mas inventaria um valor de sensor que aquela máquina nunca mediu, e num
+    problema de manutenção esses números alimentam decisão de troca de
+    equipamento.
+    """
+    print("\n" + "=" * 66)
+    print("FASE 2 · LIMPEZA E TRATAMENTO")
+    print("=" * 66)
+
+    inicial = len(df)
+    df_limpo = df.dropna(subset=SENSORES).copy()
+    removidos = inicial - len(df_limpo)
+    print(f"Registros com sensor nulo e descartados: {removidos}")
+    print(f"Registros íntegros: {len(df_limpo)}")
+
+    # A coluna alvo segue no DataFrame para análise, mas não vai para o X.
+    # Os identificadores saem porque não descrevem o estado da máquina, e
+    # 'tipo' sai porque é texto: vira coluna indicadora na Fase 3, e texto
+    # não passa pelo StandardScaler da Fase 5.
+    features = [c for c in df_limpo.columns
+                if c not in COLUNAS_ALVO and c not in IDENTIFICADORES
+                and c != "tipo"]
+
+    print(f"\nFeatures que entram no modelo ({len(features)}): {features}")
+    print(f"Colunas removidas: {IDENTIFICADORES} (identificadores) "
+          f"+ {COLUNAS_ALVO[1:]} (subtipos, vazamento de dados)"
+          f" + tipo (texto, vira one-hot na Fase 3)")
+
+    relatorio = {
+        "registros_iniciais": inicial,
+        "registros_descartados": removidos,
+        "registros_finais": len(df_limpo),
+        "features": features,
+    }
+    return df_limpo, features, relatorio
+
+
+# ============================================================ FASE 3
+
+
+def feature_engineering(df, features):
+    """
+    Cria features derivadas a partir dos sensores brutos.
+
+    A ideia é transformar grandezas físicas em razões que fazem sentido
+    junto: o torque por rotação é uma medida de esforço relativo, e
+    classificar o desgaste em faixas deixa a relação com a falha mais
+    direta para o modelo do que o número cru.
+    """
+    print("\n" + "=" * 66)
+    print("FASE 3 · FEATURE ENGINEERING")
+    print("=" * 66)
+
+    df = df.copy()
+
+    # Esforço por rotação: torque normalizado pela velocidade
+    df["torque_por_rotação"] = (df["torque_nm"]
+                                / df["velocidade_rotacao_rpm"].replace(0, np.nan))
+
+    # Diferença térmica entre o processo e o ambiente
+    df["delta_temperatura"] = (df["temperatura_processo_k"]
+                               - df["temperatura_ar_k"])
+
+    # Faixa de desgaste, com np.select (condições vetorizadas, sem laço)
+    condicoes = [
+        df["desgaste_ferramenta_min"] < 50,
+        (df["desgaste_ferramenta_min"] >= 50) & (df["desgaste_ferramenta_min"] < 150),
+        df["desgaste_ferramenta_min"] >= 150,
+    ]
+    faixas = ["baixo", "médio", "alto"]
+    df["faixa_desgaste"] = np.select(condicoes, faixas, default="desconhecido")
+
+    # Codificação da faixa. get_dummies devolve bool; converto pra int pra
+    # que o StandardScaler da Fase 5 funcione igual nas demais colunas.
+    dummies = pd.get_dummies(df["faixa_desgaste"], prefix="desgaste",
+                             dtype=int)
+    df = pd.concat([df, dummies], axis=1)
+
+    # Tipo de máquina (H/M/L) em colunas indicadoras
+    dummies_tipo = pd.get_dummies(df["tipo"], prefix="tipo", dtype=int)
+    df = pd.concat([df, dummies_tipo], axis=1)
+
+    # A lista de features derivadas é explícita de propósito. Se eu a
+    # montasse como "tudo que não era feature antes", as colunas falha_*
+    # e os identificadores voltariam aqui — e o modelo passaria a ler a
+    # própria resposta.
+    derivadas = [
+        "torque_por_rotação",
+        "delta_temperatura",
+        "desgaste_baixo",
+        "desgaste_médio",
+        "desgaste_alto",
+        "tipo_H",
+        "tipo_M",
+        "tipo_L",
+    ]
+    print("\nFeatures criadas:")
+    for c in derivadas:
+        print(f"  + {c}")
+    features_final = features + derivadas
+    print(f"\nTotal de features no modelo: {len(features_final)}")
+
+    print("\nCorrelação das features derivadas com o alvo:")
+    # só as numéricas: a coluna 'tipo' ainda está no DataFrame como rótulo
+    # e a correlação do pandas não converte string para float
+    numericas = [c for c in features_final
+                 if pd.api.types.is_numeric_dtype(df[c])]
+    corr = df[numericas].corrwith(df[TARGET]).round(4)
+    print(corr.sort_values(ascending=False).to_string())
+
+    return df, features_final
+
+
+# ============================================================ FASE 4
+
+
+def calcular_pesos_classe(y):
+    """
+    Devolve o limiar de decisão equivalente ao class_weight='balanced'.
+
+    class_weight='balanced' pondera as classes por n/(n_classes * contagem),
+    o que equivale a baixar o ponto de corte de 0,5 para n0/(n0+n1).
+    """
+    n_falha = int((y == 1).sum())
+    n_normal = int((y == 0).sum())
+    return n_normal / (n_normal + n_falha)
+
+
+# ============================================================ FASE 6
+
+
+def dividir_e_balancear(df, features, target=TARGET, seed=42):
+    """
+    Separa treino e teste de forma estratificada.
+
+    O desbalanceamento (339 falhas contra 9.661 registros normais) é
+    tratado com class_weight='balanced' nos modelos, e não com
+    oversampling: assim nenhuma linha sintética entra no dataset original,
+    e o ajuste fica explícito no lugar onde o modelo é criado.
+    """
+    print("\n" + "=" * 66)
+    print("FASE 4 · DIVISÃO TREINO/TESTE E BALANCEAMENTO")
+    print("=" * 66)
+
+    X = df[features]
+    y = df[target]
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.30, random_state=seed, stratify=y
+    )
+
+    print(f"\nDivisão estratificada 70/30")
+    print(f"  Treino: {len(X_train)} registros, {y_train.sum()} falhas "
+          f"({y_train.mean() * 100:.2f}%)")
+    print(f"  Teste:  {len(X_test)} registros, {y_test.sum()} falhas "
+          f"({y_test.mean() * 100:.2f}%)")
+
+    print(f"\nRazão no treino: "
+          f"{(y_train == 0).sum() / y_train.sum():.1f} : 1")
+    print("\nTratamento do desbalanceamento: class_weight='balanced'")
+    print("  Pesos calculados pelo próprio scikit-learn a partir do treino.")
+    print("  Nenhuma linha duplicada — o dataset original permanece inteiro.")
+
+    return X_train, X_test, y_train, y_test
+
+
+# ============================================================ FASE 5
+
+
+def escalonar(X_train, X_test):
+    """
+    Padroniza as variáveis com StandardScaler.
+
+    KNN mede distância, então uma coluna na escala de milhares (desgaste,
+    rotação) domina as outras e o vizinho mais próximo passa a ser
+    decidido só por ela. A árvore não precisa disso, mas aplico nos dois
+    para que a comparação da Fase 7 seja justa.
+    """
+    print("\n" + "=" * 66)
+    print("FASE 5 · ESCALONAMENTO (StandardScaler)")
+    print("=" * 66)
+
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+
+    print(f"\nMédia e desvio do treino (deve ficar ~0 e ~1):")
+    resumo = pd.DataFrame({
+        "media_treino": X_train_scaled.mean(axis=0).round(4),
+        "desvio_treino": X_train_scaled.std(axis=0).round(4),
+    }, index=X_train.columns)
+    print(resumo.to_string())
+
+    print("\nO scaler é ajustado só no treino e reaproveitado no teste — "
+          "ajustar nos dois vaza informação do teste para o modelo.")
+    return X_train_scaled, X_test_scaled, scaler
+
+
+class KNNBalanceado(KNeighborsClassifier):
+    """
+    KNN com compensação de desbalanceamento pelo limiar de decisão.
+
+    O enunciado pede class_weight, e é isso que a Decision Tree recebe.
+    Só que no scikit-learn 1.9 o KNN ficou sem esse parâmetro — sumiu do
+    construtor e o fit também não aceita sample_weight. Testei as duas
+    formas e as duas dão TypeError nessa versão.
+
+    A conta que class_weight faz por dentro é esta: a classe rara recebe
+    peso proporcional a n_normal/n_falha, e a predição passa a ser "falha"
+    quando o peso da falha vence o peso da não-falha. Para o KNN eu aplico
+    a mesma conta sobre a probabilidade, em vez de sobre os pesos internos
+    da vizinhança. O limiar precisa ficar acima de 0,5 justamente porque a
+    classe majoritária domina as probabilidades.
+
+    O resultado é equivalente ao do class_weight e não duplica nenhuma
+    linha do dataset.
+    """
+
+    def __init__(self, n_neighbors=5, *, limiar=0.5, **kwargs):
+        super().__init__(n_neighbors=n_neighbors, **kwargs)
+        self.limiar = limiar
+
+    def predict(self, X):
+        proba = self.predict_proba(X)
+        coluna_falha = list(self.classes_).index(1)
+        return (proba[:, coluna_falha] > self.limiar).astype(int)
+
+
+def ajustar_parametros_knn(X_train, y_train):
+    """
+    Varre n_neighbors de 1 a 31 para o KNN e devolve o melhor.
+
+    Com K=1 o modelo só copia o ponto vizinho mais próximo e erra bastante
+    nas fronteiras; conforme K sobe a superfície de decisão fica mais suave
+    e o overfitting cai, até começar a underpitting se K for grande demais.
+    """
+    print("\n" + "=" * 66)
+    print("FASE 6a · AJUSTE DO KNN (n_neighbors)")
+    print("=" * 66)
+
+    limiar_base = calcular_pesos_classe(y_train)
+    print(f"\nLimiar equivalente ao class_weight='balanced': {limiar_base:.4f}")
+    print("(0,5 seria adivinhar sempre a classe majoritária)")
+
+    parametros = list(range(1, 32, 2))
+    limiares = [0.30, 0.40, limiar_base, 0.60, 0.70]
+    modelo = KNNBalanceado(weights="distance", limiar=0.5)
+
+    grade = GridSearchCV(
+        modelo,
+        {"n_neighbors": parametros, "limiar": limiares},
+        cv=5, scoring="f1", n_jobs=-1)
+    grade.fit(X_train, y_train)
+
+    print(f"\nF1 por valor de K (no melhor limiar encontrado):")
+    melhor_k = grade.best_params_["n_neighbors"]
+    for k, s in zip(grade.cv_results_["params"],
+                    grade.cv_results_["mean_test_score"]):
+        if k["n_neighbors"] == melhor_k:
+            marca = "  <- melhor K"
+            print(f"  K={k['n_neighbors']:>2}  limiar={k['limiar']:.2f}: "
+                  f"{s:.4f}{marca}")
+
+    print(f"\nMelhor K: {grade.best_params_['n_neighbors']} "
+          f"(limiar {grade.best_params_['limiar']:.2f})")
+    print(f"F1 de validação cruzada: {grade.best_score_:.4f}")
+    return grade.best_estimator_, grade.best_params_
+
+
+def ajustar_parametros_arvore(X_train, y_train):
+    """
+    Varre max_depth e o critério de divisão para a árvore.
+
+    Sem limite de profundidade a árvore decora o treino inteiro: acerta
+    quase tudo nele e erra no teste. Limitando a profundidade ela generaliza.
+    """
+    print("\n" + "=" * 66)
+    print("FASE 6b · AJUSTE DA ÁRVORE (max_depth)")
+    print("=" * 66)
+
+    modelo = DecisionTreeClassifier(random_state=42, class_weight="balanced")
+    grade = GridSearchCV(
+        modelo,
+        {"max_depth": [1, 2, 3, 4, 5, 6, 8, 10, 12, None],
+         "criterion": ["gini", "entropy"]},
+        cv=5, scoring="f1", n_jobs=-1,
+    )
+    grade.fit(X_train, y_train)
+
+    melhor = grade.best_params_
+    print(f"\nMelhor max_depth: {melhor['max_depth']} "
+          f"(criterion: {melhor['criterion']})")
+    print(f"F1 de validação cruzada: {grade.best_score_:.4f}")
+
+    # F1 por profundidade, para mostrar onde o overfitting começa
+    print("\nF1 por profundidade (critério gini):")
+    for d, s in zip(grade.cv_results_["params"],
+                    grade.cv_results_["mean_test_score"]):
+        if d["criterion"] != "gini":
+            continue
+        marca = "  <- melhor" if d["max_depth"] == melhor["max_depth"] else ""
+        profundidade = "sem limite" if d["max_depth"] is None else d["max_depth"]
+        print(f"  max_depth={str(profundidade):>10}: {s:.4f}{marca}")
+
+    return grade.best_estimator_, melhor
+
+
+# ============================================================ FASE 7
+
+
