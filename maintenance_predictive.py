@@ -170,3 +170,49 @@ def analise_exploratoria(df):
 # ============================================================ FASE 2
 
 
+def limpar_dados(df):
+    """
+    Descarta os registros com sensores faltantes e remove as colunas que
+    não podem entrar como feature.
+
+    São 500 registros (5%) com pelo menos um sensor nulo, descartados em
+    vez de preenchidos com a mediana. Completar preservaria 500 linhas,
+    mas inventaria um valor de sensor que aquela máquina nunca mediu, e num
+    problema de manutenção esses números alimentam decisão de troca de
+    equipamento.
+    """
+    print("\n" + "=" * 66)
+    print("FASE 2 · LIMPEZA E TRATAMENTO")
+    print("=" * 66)
+
+    inicial = len(df)
+    df_limpo = df.dropna(subset=SENSORES).copy()
+    removidos = inicial - len(df_limpo)
+    print(f"Registros com sensor nulo e descartados: {removidos}")
+    print(f"Registros íntegros: {len(df_limpo)}")
+
+    # A coluna alvo segue no DataFrame para análise, mas não vai para o X.
+    # Os identificadores saem porque não descrevem o estado da máquina, e
+    # 'tipo' sai porque é texto: vira coluna indicadora na Fase 3, e texto
+    # não passa pelo StandardScaler da Fase 5.
+    features = [c for c in df_limpo.columns
+                if c not in COLUNAS_ALVO and c not in IDENTIFICADORES
+                and c != "tipo"]
+
+    print(f"\nFeatures que entram no modelo ({len(features)}): {features}")
+    print(f"Colunas removidas: {IDENTIFICADORES} (identificadores) "
+          f"+ {COLUNAS_ALVO[1:]} (subtipos, vazamento de dados)"
+          f" + tipo (texto, vira one-hot na Fase 3)")
+
+    relatorio = {
+        "registros_iniciais": inicial,
+        "registros_descartados": removidos,
+        "registros_finais": len(df_limpo),
+        "features": features,
+    }
+    return df_limpo, features, relatorio
+
+
+# ============================================================ FASE 3
+
+
