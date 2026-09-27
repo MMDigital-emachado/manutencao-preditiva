@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.ipynb_checkpoints/
+.venv/
+venv/
+
+# dataset original e resultados gerados: os dois podem ser reproduzidos
+# rodando maintenance_predictive.py, então não vão para o Git
+manutencao_preditiva.csv
+outputs/
+
+# script temporário de reconstrução do histórico
+_git_history.py
