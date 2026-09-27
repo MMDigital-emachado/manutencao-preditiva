@@ -170,3 +170,178 @@ def analise_exploratoria(df):
 # ============================================================ FASE 2
 
 
+def limpar_dados(df):
+    """
+    Descarta os registros com sensores faltantes e remove as colunas que
+    não podem entrar como feature.
+
+    São 500 registros (5%) com pelo menos um sensor nulo, descartados em
+    vez de preenchidos com a mediana. Completar preservaria 500 linhas,
+    mas inventaria um valor de sensor que aquela máquina nunca mediu, e num
+    problema de manutenção esses números alimentam decisão de troca de
+    equipamento.
+    """
+    print("\n" + "=" * 66)
+    print("FASE 2 · LIMPEZA E TRATAMENTO")
+    print("=" * 66)
+
+    inicial = len(df)
+    df_limpo = df.dropna(subset=SENSORES).copy()
+    removidos = inicial - len(df_limpo)
+    print(f"Registros com sensor nulo e descartados: {removidos}")
+    print(f"Registros íntegros: {len(df_limpo)}")
+
+    # A coluna alvo segue no DataFrame para análise, mas não vai para o X.
+    # Os identificadores saem porque não descrevem o estado da máquina, e
+    # 'tipo' sai porque é texto: vira coluna indicadora na Fase 3, e texto
+    # não passa pelo StandardScaler da Fase 5.
+    features = [c for c in df_limpo.columns
+                if c not in COLUNAS_ALVO and c not in IDENTIFICADORES
+                and c != "tipo"]
+
+    print(f"\nFeatures que entram no modelo ({len(features)}): {features}")
+    print(f"Colunas removidas: {IDENTIFICADORES} (identificadores) "
+          f"+ {COLUNAS_ALVO[1:]} (subtipos, vazamento de dados)"
+          f" + tipo (texto, vira one-hot na Fase 3)")
+
+    relatorio = {
+        "registros_iniciais": inicial,
+        "registros_descartados": removidos,
+        "registros_finais": len(df_limpo),
+        "features": features,
+    }
+    return df_limpo, features, relatorio
+
+
+# ============================================================ FASE 3
+
+
+def feature_engineering(df, features):
+    """
+    Cria features derivadas a partir dos sensores brutos.
+
+    A ideia é transformar grandezas físicas em razões que fazem sentido
+    junto: o torque por rotação é uma medida de esforço relativo, e
+    classificar o desgaste em faixas deixa a relação com a falha mais
+    direta para o modelo do que o número cru.
+    """
+    print("\n" + "=" * 66)
+    print("FASE 3 · FEATURE ENGINEERING")
+    print("=" * 66)
+
+    df = df.copy()
+
+    # Esforço por rotação: torque normalizado pela velocidade
+    df["torque_por_rotação"] = (df["torque_nm"]
+                                / df["velocidade_rotacao_rpm"].replace(0, np.nan))
+
+    # Diferença térmica entre o processo e o ambiente
+    df["delta_temperatura"] = (df["temperatura_processo_k"]
+                               - df["temperatura_ar_k"])
+
+    # Faixa de desgaste, com np.select (condições vetorizadas, sem laço)
+    condicoes = [
+        df["desgaste_ferramenta_min"] < 50,
+        (df["desgaste_ferramenta_min"] >= 50) & (df["desgaste_ferramenta_min"] < 150),
+        df["desgaste_ferramenta_min"] >= 150,
+    ]
+    faixas = ["baixo", "médio", "alto"]
+    df["faixa_desgaste"] = np.select(condicoes, faixas, default="desconhecido")
+
+    # Codificação da faixa. get_dummies devolve bool; converto pra int pra
+    # que o StandardScaler da Fase 5 funcione igual nas demais colunas.
+    dummies = pd.get_dummies(df["faixa_desgaste"], prefix="desgaste",
+                             dtype=int)
+    df = pd.concat([df, dummies], axis=1)
+
+    # Tipo de máquina (H/M/L) em colunas indicadoras
+    dummies_tipo = pd.get_dummies(df["tipo"], prefix="tipo", dtype=int)
+    df = pd.concat([df, dummies_tipo], axis=1)
+
+    # A lista de features derivadas é explícita de propósito. Se eu a
+    # montasse como "tudo que não era feature antes", as colunas falha_*
+    # e os identificadores voltariam aqui — e o modelo passaria a ler a
+    # própria resposta.
+    derivadas = [
+        "torque_por_rotação",
+        "delta_temperatura",
+        "desgaste_baixo",
+        "desgaste_médio",
+        "desgaste_alto",
+        "tipo_H",
+        "tipo_M",
+        "tipo_L",
+    ]
+    print("\nFeatures criadas:")
+    for c in derivadas:
+        print(f"  + {c}")
+    features_final = features + derivadas
+    print(f"\nTotal de features no modelo: {len(features_final)}")
+
+    print("\nCorrelação das features derivadas com o alvo:")
+    # só as numéricas: a coluna 'tipo' ainda está no DataFrame como rótulo
+    # e a correlação do pandas não converte string para float
+    numericas = [c for c in features_final
+                 if pd.api.types.is_numeric_dtype(df[c])]
+    corr = df[numericas].corrwith(df[TARGET]).round(4)
+    print(corr.sort_values(ascending=False).to_string())
+
+    return df, features_final
+
+
+# ============================================================ FASE 4
+
+
+def calcular_pesos_classe(y):
+    """
+    Devolve o limiar de decisão equivalente ao class_weight='balanced'.
+
+    class_weight='balanced' pondera as classes por n/(n_classes * contagem),
+    o que equivale a baixar o ponto de corte de 0,5 para n0/(n0+n1).
+    """
+    n_falha = int((y == 1).sum())
+    n_normal = int((y == 0).sum())
+    return n_normal / (n_normal + n_falha)
+
+
+# ============================================================ FASE 6
+
+
+def dividir_e_balancear(df, features, target=TARGET, seed=42):
+    """
+    Separa treino e teste de forma estratificada.
+
+    O desbalanceamento (339 falhas contra 9.661 registros normais) é
+    tratado com class_weight='balanced' nos modelos, e não com
+    oversampling: assim nenhuma linha sintética entra no dataset original,
+    e o ajuste fica explícito no lugar onde o modelo é criado.
+    """
+    print("\n" + "=" * 66)
+    print("FASE 4 · DIVISÃO TREINO/TESTE E BALANCEAMENTO")
+    print("=" * 66)
+
+    X = df[features]
+    y = df[target]
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.30, random_state=seed, stratify=y
+    )
+
+    print(f"\nDivisão estratificada 70/30")
+    print(f"  Treino: {len(X_train)} registros, {y_train.sum()} falhas "
+          f"({y_train.mean() * 100:.2f}%)")
+    print(f"  Teste:  {len(X_test)} registros, {y_test.sum()} falhas "
+          f"({y_test.mean() * 100:.2f}%)")
+
+    print(f"\nRazão no treino: "
+          f"{(y_train == 0).sum() / y_train.sum():.1f} : 1")
+    print("\nTratamento do desbalanceamento: class_weight='balanced'")
+    print("  Pesos calculados pelo próprio scikit-learn a partir do treino.")
+    print("  Nenhuma linha duplicada — o dataset original permanece inteiro.")
+
+    return X_train, X_test, y_train, y_test
+
+
+# ============================================================ FASE 5
+
+
